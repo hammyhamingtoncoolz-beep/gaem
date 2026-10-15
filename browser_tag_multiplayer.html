@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser Tag — P2P Multiplayer</title>
+<style>
+  :root { color-scheme: dark; --bg:#10151d; --panel:#192330; --line:#2c3b4d; --text:#eef5ff; --muted:#a9b8ca; --accent:#7ce0a3; }
+  * { box-sizing:border-box }
+  body { margin:0; min-height:100vh; background:radial-gradient(ellipse at top,#1d2b38,#0d1118 70%); color:var(--text); font:16px/1.4 system-ui,Segoe UI,sans-serif; display:flex; align-items:center; justify-content:center; padding:20px; }
+  main { width:min(100%,1000px); }
+  h1 { margin:0 0 4px; font-size:clamp(1.6rem,4vw,2.3rem); letter-spacing:-.04em; }
+  .sub { color:var(--muted); margin:0 0 18px; }
+  .panel { background:rgba(25,35,48,.94); border:1px solid var(--line); border-radius:16px; padding:14px; margin-bottom:14px; }
+  .controls { display:flex; gap:9px; flex-wrap:wrap; align-items:center; }
+  input,button { border-radius:9px; border:1px solid #40536a; padding:10px 12px; font:inherit; }
+  input { color:var(--text); background:#0e151e; min-width:0; }
+  #username { width:150px; }
+  #roomCode { width:145px; text-transform:uppercase; }
+  button { background:#29394c; color:var(--text); cursor:pointer; font-weight:650; }
+  button.primary { background:var(--accent); color:#102018; border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #status { color:var(--muted); margin:10px 0 0; min-height:1.4em; }
+  .hud { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:.95rem; margin-bottom:10px; }
+  #arena { width:100%; display:block; border:1px solid #3d594a; border-radius:14px; background:#254e36; touch-action:none; }
+  .bottom { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }
+  h2 { font-size:1rem; margin:0 0 8px; }
+  #players { margin:0; padding-left:20px; color:var(--muted); }
+  .hint { color:var(--muted); font-size:.9rem; margin:0; }
+  .tag { color:#ffbd69; font-weight:800; }
+  @media(max-width:650px) { .bottom { grid-template-columns:1fr } .controls input { flex:1 } }
+</style>
+</head>
+<body>
+<main>
+  <h1>TAG <span style="color:var(--accent)">//</span> P2P</h1>
+  <p class="sub">A tiny browser multiplayer test. Run it in two different browsers and share a room code.</p>
+
+  <section class="panel">
+    <div class="controls">
+      <input id="username" maxlength="16" placeholder="Temporary username" value="Player">
+      <button id="host" class="primary">Host game</button>
+      <input id="roomCode" maxlength="12" placeholder="ROOM CODE">
+      <button id="join">Join game</button>
+      <button id="leave" disabled>Leave</button>
+    </div>
+    <p id="status">Choose a temporary username, then host a game or join a friend's room.</p>
+  </section>
+
+  <section class="panel">
+    <div class="hud">
+      <span>Room: <strong id="roomLabel">—</strong></span>
+      <span id="roleLabel">Not connected</span>
+      <span>Controls: <strong>WASD / Arrow keys</strong></span>
+    </div>
+    <canvas id="arena" width="900" height="520" aria-label="Tag game arena"></canvas>
+  </section>
+
+  <div class="bottom">
+    <section class="panel">
+      <h2>Players</h2>
+      <ul id="players"><li>Waiting for players…</li></ul>
+    </section>
+    <section class="panel">
+      <h2>How to play</h2>
+      <p class="hint">Move around the arena. The player marked <span class="tag">IT</span> tries to touch another player to pass the tag. Host starts as IT. This is a prototype: the host browser runs the simple tag rules.</p>
+    </section>
+  </div>
+</main>
+
+<script type="module">
+import { joinRoom, selfId } from "https://esm.run/trystero";
+
+const APP_ID = "hamham-browser-tag-prototype-v1";
+const W = 900, H = 520, R = 15, SPEED = 230;
+const canvas = document.querySelector("#arena");
+const ctx = canvas.getContext("2d");
+const statusEl = document.querySelector("#status");
+const roomCodeEl = document.querySelector("#roomCode");
+const roomLabel = document.querySelector("#roomLabel");
+const roleLabel = document.querySelector("#roleLabel");
+const playersEl = document.querySelector("#players");
+const nameInput = document.querySelector("#username");
+const hostButton = document.querySelector("#host");
+const joinButton = document.querySelector("#join");
+const leaveButton = document.querySelector("#leave");
+
+let room = null, sendHello = null, sendPosition = null, sendGame = null;
+let myName = "Player", myId = selfId, isHost = false, roomId = "";
+let lastSend = 0, lastGameSend = 0, lastTagTime = 0;
+const peers = new Map();
+const keys = new Set();
+const me = { x: W/2, y: H/2, name: "Player", color: "#70d6ff" };
+let taggerId = null;
+let gameStarted = false;
+let message = "Host a room or join one";
+let messageUntil = 0;
+
+function cleanName(value) {
+  return (value || "Player").trim().replace(/[<>]/g, "").slice(0, 16) || "Player";
+}
+function randomCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(bytes, b => chars[b % chars.length]).join("");
+}
+function randColor(id) {
+  let h = 0;
+  for (let i=0; i<id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return `hsl(${h % 360} 80% 68%)`;
+}
+function setStatus(s) { statusEl.textContent = s; }
+function makePlayer(id, name, x, y, color) {
+  return { id, name: cleanName(name), x, y, color: color || randColor(id) };
+}
+function allPlayers() {
+  const list = [makePlayer(myId, myName, me.x, me.y, "#70d6ff")];
+  for (const [id, p] of peers) list.push(makePlayer(id, p.name, p.x, p.y, p.color));
+  return list;
+}
+function announceName(target) {
+  if (sendHello) sendHello({ name: myName }, target ? { target } : {});
+}
+function sendMyPosition() {
+  if (sendPosition && room) sendPosition({ x: me.x, y: me.y, name: myName });
+}
+function sendGameState() {
+  if (!isHost || !sendGame) return;
+  sendGame({
+    players: allPlayers().map(p => ({ id:p.id, name:p.name, x:p.x, y:p.y, color:p.color })),
+    taggerId, started: gameStarted, sentAt: Date.now()
+  });
+}
+function updatePlayerList() {
+  const list = allPlayers();
+  playersEl.replaceChildren();
+  if (!list.length) {
+    playersEl.innerHTML = "<li>Waiting for players…</li>";
+    return;
+  }
+  for (const p of list) {
+    const li = document.createElement("li");
+    li.textContent = `${p.name}${p.id === taggerId ? " — IT!" : ""}${p.id === myId ? " (you)" : ""}`;
+    if (p.id === taggerId) li.className = "tag";
+    playersEl.appendChild(li);
+  }
+}
+async function connect(code, hostMode) {
+  if (room) await disconnect(false);
+  myName = cleanName(nameInput.value);
+  nameInput.value = myName;
+  isHost = hostMode;
+  roomId = code.trim().toUpperCase();
+  if (!roomId) return;
+  me.x = hostMode ? W/2 : 100 + Math.random()*(W-200);
+  me.y = hostMode ? H/2 : 100 + Math.random()*(H-200);
+  me.name = myName;
+  peers.clear();
+  taggerId = hostMode ? myId : null;
+  gameStarted = hostMode;
+  roomLabel.textContent = roomId;
+  roleLabel.textContent = hostMode ? "Host" : "Player";
+  hostButton.disabled = joinButton.disabled = true;
+  leaveButton.disabled = false;
+  setStatus("Connecting to room… keep this tab open.");
+  room = joinRoom({ appId: APP_ID }, roomId);
+  sendHello = room.makeAction("tag-hello");
+  sendPosition = room.makeAction("tag-position");
+  sendGame = room.makeAction("tag-game-state");
+
+  sendHello.onMessage = (data, { peerId }) => {
+    if (!data || typeof data.name !== "string") return;
+    const old = peers.get(peerId) || { x: W/2, y: H/2 };
+    peers.set(peerId, { ...old, name: cleanName(data.name), color: randColor(peerId) });
+    updatePlayerList();
+    if (isHost) sendGameState();
+  };
+  sendPosition.onMessage = (data, { peerId }) => {
+    if (!isHost || !data || !Number.isFinite(data.x) || !Number.isFinite(data.y)) return;
+    const old = peers.get(peerId) || { name: "Player", color: randColor(peerId) };
+    peers.set(peerId, {
+      ...old,
+      x: Math.max(R, Math.min(W-R, data.x)),
+      y: Math.max(R, Math.min(H-R, data.y)),
+      name: cleanName(data.name || old.name)
+    });
+  };
+  sendGame.onMessage = (data, { peerId }) => {
+    if (isHost || !data || !Array.isArray(data.players)) return;
+    for (const p of data.players) {
+      if (p.id === myId) continue;
+      peers.set(p.id, { name: cleanName(p.name), x:p.x, y:p.y, color:p.color || randColor(p.id) });
+    }
+    for (const id of [...peers.keys()]) {
+      if (!data.players.some(p => p.id === id)) peers.delete(id);
+    }
+    taggerId = data.taggerId;
+    gameStarted = !!data.started;
+    updatePlayerList();
+  };
+  room.onPeerJoin = peerId => {
+    setStatus("Connected to a player! Syncing names and positions…");
+    announceName(peerId);
+    if (isHost) sendGameState();
+  };
+  room.onPeerLeave = peerId => {
+    peers.delete(peerId);
+    updatePlayerList();
+    if (isHost) sendGameState();
+    setStatus("A player left the room.");
+  };
+  // Announce after joining, and again when peers arrive.
+  announceName();
+  setTimeout(() => {
+    if (room) {
+      setStatus("In room " + roomId + ". Share the code with a friend.");
+      sendMyPosition();
+      sendGameState();
+    }
+  }, 1200);
+  updatePlayerList();
+}
+async function disconnect(updateStatus = true) {
+  const old = room;
+  room = null;
+  sendHello = sendPosition = sendGame = null;
+  peers.clear();
+  if (old) { try { await old.leave(); } catch {} }
+  isHost = false;
+  taggerId = null;
+  gameStarted = false;
+  roomLabel.textContent = "—";
+  roleLabel.textContent = "Not connected";
+  hostButton.disabled = joinButton.disabled = false;
+  leaveButton.disabled = true;
+  updatePlayerList();
+  if (updateStatus) setStatus("Left the room.");
+}
+hostButton.addEventListener("click", () => {
+  const code = randomCode();
+  roomCodeEl.value = code;
+  connect(code, true);
+});
+joinButton.addEventListener("click", () => {
+  const code = roomCodeEl.value.trim();
+  if (!code) { setStatus("Enter a room code first."); return; }
+  connect(code, false);
+});
+leaveButton.addEventListener("click", () => disconnect());
+roomCodeEl.addEventListener("keydown", e => { if (e.key === "Enter") joinButton.click(); });
+nameInput.addEventListener("change", () => {
+  myName = cleanName(nameInput.value);
+  nameInput.value = myName;
+  announceName();
+  updatePlayerList();
+});
+
+window.addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
+  keys.add(k);
+});
+window.addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+window.addEventListener("blur", () => keys.clear());
+
+function update(dt) {
+  let dx = 0, dy = 0;
+  if (keys.has("a") || keys.has("arrowleft")) dx--;
+  if (keys.has("d") || keys.has("arrowright")) dx++;
+  if (keys.has("w") || keys.has("arrowup")) dy--;
+  if (keys.has("s") || keys.has("arrowdown")) dy++;
+  if (dx && dy) { dx *= Math.SQRT1_2; dy *= Math.SQRT1_2; }
+  me.x = Math.max(R, Math.min(W-R, me.x + dx*SPEED*dt));
+  me.y = Math.max(R, Math.min(H-R, me.y + dy*SPEED*dt));
+
+  if (isHost && gameStarted) {
+    const now = performance.now();
+    if (now - lastTagTime > 900) {
+      const list = allPlayers();
+      const tagger = list.find(p => p.id === taggerId);
+      if (tagger) {
+        for (const p of list) {
+          if (p.id === taggerId) continue;
+          if (Math.hypot(p.x-tagger.x, p.y-tagger.y) < R*2.2) {
+            taggerId = p.id;
+            lastTagTime = now;
+            message = `${p.name} is IT!`;
+            messageUntil = now + 1800;
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+function draw() {
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = "#245137";
+  ctx.fillRect(0,0,W,H);
+  // Subtle grass grid
+  ctx.strokeStyle = "rgba(220,255,220,.055)";
+  ctx.lineWidth = 1;
+  for (let x=0; x<W; x+=40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y=0; y<H; y+=40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  // Obstacles
+  for (const [x,y,r] of [[115,105,26],[770,100,31],[170,405,22],[710,390,27],[445,90,18],[450,445,22]]) {
+    ctx.fillStyle="#183b2b"; ctx.beginPath(); ctx.arc(x+3,y+5,r,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#3e8050"; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#5aa468"; ctx.beginPath(); ctx.arc(x-6,y-7,r*.52,0,Math.PI*2); ctx.fill();
+  }
+  const list = allPlayers();
+  for (const p of list) {
+    const isMe = p.id === myId;
+    const isTagger = p.id === taggerId;
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.beginPath(); ctx.ellipse(p.x,p.y+8,R+2,8,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = isTagger ? "#ffb454" : (isMe ? "#70d6ff" : (p.color || "#ff79c6"));
+    ctx.beginPath(); ctx.arc(p.x,p.y,R,0,Math.PI*2); ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = isMe ? "#ffffff" : "rgba(0,0,0,.25)";
+    ctx.stroke();
+    if (isTagger) {
+      ctx.fillStyle="#fff1d6"; ctx.font="bold 13px system-ui"; ctx.textAlign="center";
+      ctx.fillText("IT",p.x,p.y-R-10);
+    }
+    ctx.fillStyle="#fff"; ctx.font="bold 13px system-ui"; ctx.textAlign="center";
+    ctx.shadowColor="#12251a"; ctx.shadowBlur=4;
+    ctx.fillText(p.name, p.x, p.y+R+18);
+    ctx.shadowBlur=0;
+  }
+  if (!room) {
+    ctx.fillStyle="rgba(5,12,9,.48)"; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle="#fff"; ctx.textAlign="center"; ctx.font="bold 30px system-ui";
+    ctx.fillText("HOST OR JOIN A ROOM",W/2,H/2-5);
+    ctx.font="16px system-ui"; ctx.fillStyle="#d5e7da";
+    ctx.fillText("Open this file in another browser to test multiplayer",W/2,H/2+27);
+  } else if (performance.now() < messageUntil) {
+    ctx.fillStyle="rgba(5,12,9,.55)"; ctx.fillRect(W/2-150,14,300,38);
+    ctx.fillStyle="#fff"; ctx.textAlign="center"; ctx.font="bold 18px system-ui";
+    ctx.fillText(message,W/2,39);
+  }
+  updatePlayerList();
+}
+let lastFrame = performance.now();
+function frame(now) {
+  const dt = Math.min(.05,(now-lastFrame)/1000);
+  lastFrame = now;
+  update(dt);
+  if (room && now-lastSend > 65) { sendMyPosition(); lastSend = now; }
+  if (isHost && room && now-lastGameSend > 100) { sendGameState(); lastGameSend = now; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
